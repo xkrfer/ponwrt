@@ -70,6 +70,12 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
+      - name: Add Airoha NPU status app
+        run: |
+          git clone --depth 1 https://github.com/rchen14b/luci-app-airoha-npu.git /tmp/airoha-npu
+          cp -r /tmp/airoha-npu/luci-app-airoha-npu feeds/luci/applications/
+          ./scripts/feeds install luci-app-airoha-npu
+
       - name: Load repository signing key
         env:
           PONWRT_APK_PRIVATE_KEY: ${{ secrets.PONWRT_APK_PRIVATE_KEY }}
