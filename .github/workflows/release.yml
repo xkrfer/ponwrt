@@ -200,6 +200,11 @@ jobs:
       BUILD_DATE: ${{ needs.prepare.outputs.date }}
       BUILD_HASH: ${{ needs.prepare.outputs.short }}
       VARIANT: ${{ matrix.variant }}
+      # 仓库的 Actions cache 配额只有 10 GiB，而 ccache 单个目录默认上限 5 GiB。
+      # 不限制体积的话，两份工具链 + 一份源码包 + 三变体的 .ccache 会把配额挤爆，
+      # 老缓存被 LRU 淘汰后下次构建又要从头编译。
+      CCACHE_MAXSIZE: 2G
+      CCACHE_COMPRESS: 'true'
 
     steps:
       - uses: actions/checkout@v6
@@ -262,6 +267,7 @@ jobs:
             echo "未命中工具链缓存，本次完整构建工具链"
           fi
           ccache --version | head -1
+          ccache -p | grep -Ei 'max.?size|compression' || true
           ccache -s | head -3 || true
 
       - name: Install feeds
@@ -332,6 +338,11 @@ jobs:
           done
           if ! grep -q "^CONFIG_PACKAGE_luci-app-airoha-npu=y$" .config; then
             echo "❌ 缺少 NPU 状态页" >&2
+            exit 1
+          fi
+          # ccache 是这套缓存方案的地基；它悄悄失效的话构建只是变慢，不会报错，所以在这里卡一道
+          if ! grep -qx 'CONFIG_CCACHE=y' .config; then
+            echo "❌ CONFIG_CCACHE 未生效（检查 config/Config-devel.in 是否又把 ccache 关进 DEVEL）" >&2
             exit 1
           fi
           if [ "$VARIANT" = "dae" ]; then
@@ -421,6 +432,8 @@ jobs:
           delete_old_caches "$CACHE_BASE-ccache-" "$CACHE_BASE-ccache-${{ needs.prepare.outputs.sha }}"
           # 早期版本按目标各存了一份源码包缓存（各 2.4 GiB），现已改为共享一份
           delete_old_caches "$CACHE_BASE-dl-" ""
+          # 共享的源码包缓存：键跟着 feeds/配置内容走，配置一变旧键就没用了
+          delete_old_caches "ponwrt-dl-" "ponwrt-dl-${{ hashFiles('feeds.conf.default', 'configs/*.config', 'configs/variants/*.config') }}"
           echo "superseded caches cleanup done"
 
   release:
