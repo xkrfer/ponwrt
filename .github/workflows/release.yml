@@ -55,7 +55,7 @@ jobs:
         run: |
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
-          echo "date=$(TZ=UTC-8 date +'%Y.%m.%d-%H.%M')" >> "$GITHUB_OUTPUT"
+          echo "date=$(TZ=UTC-8 date +'%Y.%m.%d-%H.%M.%S')" >> "$GITHUB_OUTPUT"
 
       - name: 计算构建矩阵（机型 × 代理变体）
         id: matrix
