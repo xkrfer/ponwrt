@@ -142,8 +142,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: dl
-          key: ${{ env.CACHE_BASE }}-dl-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
-          restore-keys: ${{ env.CACHE_BASE }}-dl-
+          key: ponwrt-dl-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          restore-keys: ponwrt-dl-
           lookup-only: true
 
   build:
@@ -193,8 +193,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: dl
-          key: ${{ env.CACHE_BASE }}-dl-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
-          restore-keys: ${{ env.CACHE_BASE }}-dl-
+          key: ponwrt-dl-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          restore-keys: ponwrt-dl-
 
       - name: Restore toolchain cache
         id: restore-toolchain
@@ -345,6 +345,8 @@ jobs:
           }
           delete_old_caches "$CACHE_BASE-toolchain-" "$CACHE_BASE-toolchain-${{ needs.prepare.outputs.sha }}"
           delete_old_caches "$CACHE_BASE-ccache-" "$CACHE_BASE-ccache-${{ needs.prepare.outputs.sha }}"
+          # 早期版本按目标各存了一份源码包缓存（各 2.4 GiB），现已改为共享一份
+          delete_old_caches "$CACHE_BASE-dl-" ""
           echo "superseded caches cleanup done"
 
   release:
