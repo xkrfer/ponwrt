@@ -1,30 +1,155 @@
 name: Release PonWrt
 
 on:
+  # 每 3 天早上 5:15（北京时间）检查一次；该提交已构建过就只刷新缓存，不重复编译
+  schedule:
+    - cron: '15 21 */3 * *'
+  # 手动编译
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag
-        required: true
+        description: 'Release tag（留空则自动生成 PonWrt-<日期>-<短提交>）'
+        required: false
         type: string
       prerelease:
-        description: Mark as prerelease
-        required: true
+        description: '标记为 prerelease'
+        required: false
+        default: false
+        type: boolean
+      force:
+        description: '忽略“该提交已构建”的判断，强制编译'
+        required: false
         default: true
         type: boolean
 
-# actions: write 用于构建结束后清理被新版取代的缓存
+# actions: write 用于清理被取代的缓存
 permissions:
   actions: write
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag }}
+  group: release-ponwrt
   cancel-in-progress: false
 
 jobs:
+  prepare:
+    name: 检查提交与构建标记
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      sha: ${{ steps.values.outputs.sha }}
+      short: ${{ steps.values.outputs.short }}
+      date: ${{ steps.values.outputs.date }}
+      tag: ${{ steps.decide.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: 计算构建标识
+        id: values
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(TZ=UTC-8 date +'%Y.%m.%d-%H.%M')" >> "$GITHUB_OUTPUT"
+
+      - name: 检查该提交是否已构建
+        id: built
+        uses: actions/cache/restore@v4
+        with:
+          path: .built-state/ponwrt
+          key: ponwrt-built-${{ steps.values.outputs.sha }}
+          lookup-only: true
+
+      - name: 上游漂移提示
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          status=$(gh api "repos/pbs05/ponwrt/compare/master...${{ github.repository_owner }}:master" --jq .status 2>/dev/null)
+          echo "upstream=$(gh api repos/pbs05/ponwrt/commits/master --jq .sha 2>/dev/null)"
+          case "$status" in
+            identical) note="与上游 pbs05/ponwrt 完全一致" ;;
+            ahead)     note="本地比上游多出提交（就是我们的改动）" ;;
+            behind)    note="⚠️ 上游有新提交，本地落后；需要在 GitHub 上 Sync fork 后再构建" ;;
+            diverged)  note="⚠️ 本地与上游都有新提交；需要先 Sync fork / 处理冲突" ;;
+            *)         note="未知（$status）" ;;
+          esac
+          echo "上游状态：$note"
+          {
+            echo "### PonWrt 构建准备"
+            echo ""
+            echo "- 提交：\`${{ steps.values.outputs.sha }}\`"
+            echo "- 上游状态：$note"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 决定是否编译
+        id: decide
+        env:
+          HIT: ${{ steps.built.outputs.cache-hit }}
+          FORCE: ${{ inputs.force }}
+          TAG_INPUT: ${{ inputs.tag }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ -n "$TAG_INPUT" ]; then
+            tag="$TAG_INPUT"
+          else
+            tag="PonWrt-${{ steps.values.outputs.date }}-${{ steps.values.outputs.short }}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$FORCE" = "true" ]; then
+            echo "手动强制编译"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$HIT" = "true" ]; then
+            echo "提交 ${{ steps.values.outputs.short }} 已构建过，本次只刷新缓存"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "检测到尚未构建的提交，开始编译"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # 不编译时，用 lookup-only 访问一次缓存，避免超过 7 天被 GitHub 回收
+  refresh:
+    name: 刷新缓存 ${{ matrix.target }}
+    needs: prepare
+    if: needs.prepare.outputs.build != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - an7581
+          - an7583
+    env:
+      CACHE_BASE: ponwrt-${{ matrix.target }}
+    steps:
+      - name: 访问工具链缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: staging_dir
+          key: ${{ env.CACHE_BASE }}-toolchain-${{ needs.prepare.outputs.sha }}
+          restore-keys: ${{ env.CACHE_BASE }}-toolchain-
+          lookup-only: true
+
+      - name: 访问编译器缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ${{ env.CACHE_BASE }}-ccache-${{ needs.prepare.outputs.sha }}
+          restore-keys: ${{ env.CACHE_BASE }}-ccache-
+          lookup-only: true
+
+      - name: 访问源码包缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: dl
+          key: ${{ env.CACHE_BASE }}-dl-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          restore-keys: ${{ env.CACHE_BASE }}-dl-
+          lookup-only: true
+
   build:
-    name: Build ${{ matrix.target }}
+    name: 编译 ${{ matrix.target }}
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     environment: release
@@ -36,6 +161,8 @@ jobs:
           - an7583
     env:
       CACHE_BASE: ponwrt-${{ matrix.target }}
+      BUILD_DATE: ${{ needs.prepare.outputs.date }}
+      BUILD_HASH: ${{ needs.prepare.outputs.short }}
 
     steps:
       - uses: actions/checkout@v6
@@ -76,7 +203,7 @@ jobs:
           path: |
             staging_dir/host*
             staging_dir/tool*
-          key: ${{ env.CACHE_BASE }}-toolchain-${{ github.sha }}
+          key: ${{ env.CACHE_BASE }}-toolchain-${{ needs.prepare.outputs.sha }}
           restore-keys: ${{ env.CACHE_BASE }}-toolchain-
 
       - name: Restore compiler cache
@@ -84,14 +211,13 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .ccache
-          key: ${{ env.CACHE_BASE }}-ccache-${{ github.sha }}
+          key: ${{ env.CACHE_BASE }}-ccache-${{ needs.prepare.outputs.sha }}
           restore-keys: ${{ env.CACHE_BASE }}-ccache-
 
       - name: Prepare restored caches
         run: |
           mkdir -p .ccache
           if [ -d staging_dir ]; then
-            # 让 make 认为 host 工具与交叉工具链已经构建完成，跳过这 30-50 分钟
             find staging_dir -type d -name stamp -not -path "*target*" |
               while read -r dir; do find "$dir" -type f -exec touch {} +; done
             echo "已复用工具链缓存（stamp 时间戳已刷新）"
@@ -159,17 +285,33 @@ jobs:
         if: always()
         run: ccache -s || true
 
-      - name: Pack ${{ matrix.target }}
+      - name: 整理固件并统一命名
         run: |
-          mkdir release
-          tar --zstd -cf "release/ponwrt-${{ matrix.target }}.tar.zst" \
-            -C bin/targets/airoha "${{ matrix.target }}"
+          set -e
+          mkdir -p upload
+          SRC="bin/targets/airoha/${{ matrix.target }}"
+          rm -rf "$SRC/packages" "$SRC"/*.json "$SRC"/*.buildinfo "$SRC"/sha256sums 2>/dev/null || true
+          for f in "$SRC"/*; do
+            [ -f "$f" ] || continue
+            base="$(basename "$f")"
+            case "$base" in
+              *.itb|*.bin|*.fip) ;;
+              *) continue ;;
+            esac
+            stem="${base%.*}"
+            ext="${base##*.}"
+            stem="${stem#ponwrt-airoha-${{ matrix.target }}-}"
+            stem="${stem//_/-}"
+            cp -f "$f" "upload/ponwrt-${stem}-${BUILD_DATE}-${BUILD_HASH}.${ext}"
+          done
+          echo "=== 本次产物 ==="
+          ls -lh upload
 
-      - name: Upload ${{ matrix.target }}
+      - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ponwrt-${{ matrix.target }}
-          path: release/*.tar.zst
+          name: ponwrt-${{ matrix.target }}-${{ needs.prepare.outputs.short }}
+          path: upload/*
           if-no-files-found: error
           retention-days: 7
 
@@ -177,7 +319,7 @@ jobs:
         if: steps.restore-toolchain.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          key: ${{ env.CACHE_BASE }}-toolchain-${{ github.sha }}
+          key: ${{ env.CACHE_BASE }}-toolchain-${{ needs.prepare.outputs.sha }}
           path: |
             staging_dir/host*
             staging_dir/tool*
@@ -186,7 +328,7 @@ jobs:
         if: steps.restore-ccache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          key: ${{ env.CACHE_BASE }}-ccache-${{ github.sha }}
+          key: ${{ env.CACHE_BASE }}-ccache-${{ needs.prepare.outputs.sha }}
           path: .ccache
 
       - name: Cleanup superseded caches
@@ -201,17 +343,19 @@ jobs:
               fi
             done < <(gh cache list --limit 100 --json id,key --jq '.[] | [.id, .key] | @tsv')
           }
-          delete_old_caches "$CACHE_BASE-toolchain-" "$CACHE_BASE-toolchain-${{ github.sha }}"
-          delete_old_caches "$CACHE_BASE-ccache-" "$CACHE_BASE-ccache-${{ github.sha }}"
+          delete_old_caches "$CACHE_BASE-toolchain-" "$CACHE_BASE-toolchain-${{ needs.prepare.outputs.sha }}"
+          delete_old_caches "$CACHE_BASE-ccache-" "$CACHE_BASE-ccache-${{ needs.prepare.outputs.sha }}"
           echo "superseded caches cleanup done"
 
   release:
-    name: Create release
-    needs: build
-    runs-on: ubuntu-24.04
+    name: 发布 ${{ needs.prepare.outputs.tag }}
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.build == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
       - name: Download firmware archives
         uses: actions/download-artifact@v4
@@ -222,24 +366,44 @@ jobs:
 
       - name: Create checksums
         working-directory: release
-        run: sha256sum *.tar.zst > sha256sums
+        run: |
+          sha256sum * > sha256sums
+          ls -lh
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
           args=(
             "$RELEASE_TAG"
-            release/*.tar.zst
-            release/sha256sums
+            release/*
             --repo "$GITHUB_REPOSITORY"
-            --target "$GITHUB_SHA"
+            --target "${{ needs.prepare.outputs.sha }}"
             --title "PonWrt $RELEASE_TAG"
             --generate-notes
           )
-          if [ "$PRERELEASE" = true ]; then
+          if [ "$PRERELEASE" = "true" ]; then
             args+=(--prerelease)
           fi
           gh release create "${args[@]}"
+
+  mark-built:
+    name: 记录已构建提交
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.build == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 保存构建标记
+        run: |
+          mkdir -p .built-state
+          echo "${{ needs.prepare.outputs.sha }}" > .built-state/ponwrt
+
+      - name: Save build marker
+        uses: actions/cache/save@v4
+        with:
+          path: .built-state/ponwrt
+          key: ponwrt-built-${{ needs.prepare.outputs.sha }}
