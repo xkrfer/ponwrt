@@ -1,0 +1,71 @@
+# 缓存保温：GitHub 会回收超过 7 天未被访问的缓存。本工作流每 2 天用 lookup-only
+# 的方式访问一次三类缓存（不下载内容，几秒结束），把访问时间刷新掉。
+# 手动发布节奏较慢时，它是 release 工作流里 refresh 步骤之外的独立保险。
+name: Cache-Keep
+
+on:
+  # 每 2 天 04:30（北京时间 = 20:30 UTC）
+  schedule:
+    - cron: '30 20 */2 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  keep:
+    name: 刷新缓存 ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - an7581
+          - an7583
+    env:
+      CACHE_BASE: ponwrt-${{ matrix.target }}
+    steps:
+      - name: 访问工具链缓存
+        id: toolchain
+        uses: actions/cache/restore@v4
+        with:
+          path: staging_dir
+          key: ${{ env.CACHE_BASE }}-toolchain-keepalive-${{ github.run_id }}
+          restore-keys: ${{ env.CACHE_BASE }}-toolchain-
+          lookup-only: true
+
+      - name: 访问编译器缓存
+        id: ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ${{ env.CACHE_BASE }}-ccache-keepalive-${{ github.run_id }}
+          restore-keys: ${{ env.CACHE_BASE }}-ccache-
+          lookup-only: true
+
+      - name: 访问源码包缓存
+        id: dl
+        uses: actions/cache/restore@v4
+        with:
+          path: dl
+          key: ponwrt-dl-keepalive-${{ github.run_id }}
+          restore-keys: ponwrt-dl-
+          lookup-only: true
+
+      - name: 汇总
+        env:
+          TOOLCHAIN_HIT: ${{ steps.toolchain.outputs.cache-hit }}
+          CCACHE_HIT: ${{ steps.ccache.outputs.cache-hit }}
+          DL_HIT: ${{ steps.dl.outputs.cache-hit }}
+        run: |
+          mark() { [ "$1" = "true" ] && echo "命中" || echo "未命中"; }
+          {
+            echo "### ${{ matrix.target }} 缓存状态"
+            echo ""
+            echo "| 缓存 | 状态 |"
+            echo "| --- | --- |"
+            echo "| 工具链 | $(mark "$TOOLCHAIN_HIT") |"
+            echo "| 编译器 | $(mark "$CCACHE_HIT") |"
+            echo "| 源码包 | $(mark "$DL_HIT") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "工具链=$(mark "$TOOLCHAIN_HIT") 编译器=$(mark "$CCACHE_HIT") 源码包=$(mark "$DL_HIT")"
