@@ -1,0 +1,33 @@
+name: Token Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 打印 token 权限
+        run: |
+          echo "GITHUB_TOKEN Permissions:"
+      - name: 探测写权限
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          echo "=== 1) 读仓库 ==="
+          gh api "repos/$GITHUB_REPOSITORY" --jq '.full_name' 2>&1 | head -2
+          echo "=== 2) 建 draft release（需要 contents: write）==="
+          gh api -X POST "repos/$GITHUB_REPOSITORY/releases" \
+            -f tag_name="probe-token-$GITHUB_RUN_ID" -f name="probe-token-$GITHUB_RUN_ID" -f draft=true \
+            --jq '.id, .tag_name' 2>&1 | head -4
+          echo "=== 3) 建 tag ref（需要 contents: write）==="
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/probe-ref-$GITHUB_RUN_ID" -f sha="$GITHUB_SHA" \
+            --jq '.ref' 2>&1 | head -4
+          echo "=== 4) 读 actions caches（需要 actions: read）==="
+          gh api "repos/$GITHUB_REPOSITORY/actions/caches" --jq '.total_count' 2>&1 | head -2
