@@ -312,9 +312,11 @@ jobs:
 
       - name: Configure ${{ matrix.target }}-${{ matrix.variant }}
         run: |
+          # kconfig.pl 是前缀表达式：三份配置要写成 `+ a + b c`（后者优先合并），
+          # 写成 `+ a b c` 会直接 Parse error
           ./scripts/kconfig.pl + \
             "configs/${{ matrix.target }}.config" \
-            configs/release.config \
+            + configs/release.config \
             "configs/variants/${{ matrix.variant }}.config" > .config
           make defconfig
           grep -E '^CONFIG_(CCACHE|DEVEL|AUTOREBUILD|PACKAGE_luci-app-nikki|PACKAGE_luci-app-homeproxy|PACKAGE_luci-app-daed|PACKAGE_sing-box|PACKAGE_mihomo-meta|PACKAGE_luci-app-airoha-npu|KERNEL_DEBUG_INFO_BTF|KERNEL_BPF_EVENTS)=' .config || true
