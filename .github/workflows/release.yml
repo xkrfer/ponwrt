@@ -21,6 +21,11 @@ on:
         required: false
         default: true
         type: boolean
+      variants:
+        description: '代理变体，逗号分隔（可选 nikki / homeproxy / dae）'
+        required: false
+        default: 'nikki,homeproxy,dae'
+        type: string
 
 # actions: write 用于清理被取代的缓存
 permissions:
@@ -41,6 +46,7 @@ jobs:
       short: ${{ steps.values.outputs.short }}
       date: ${{ steps.values.outputs.date }}
       tag: ${{ steps.decide.outputs.tag }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v6
 
@@ -50,6 +56,35 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
           echo "date=$(TZ=UTC-8 date +'%Y.%m.%d-%H.%M')" >> "$GITHUB_OUTPUT"
+
+      - name: 计算构建矩阵（机型 × 代理变体）
+        id: matrix
+        env:
+          VARIANTS_INPUT: ${{ inputs.variants }}
+        run: |
+          variants="${VARIANTS_INPUT:-nikki,homeproxy,dae}"
+          variants="${variants// /}"
+          IFS=',' read -r -a VARIANT_LIST <<< "$variants"
+          matrix="["
+          count=0
+          for target in an7581 an7583; do
+            for variant in "${VARIANT_LIST[@]}"; do
+              [ -n "$variant" ] || continue
+              case "$variant" in
+                nikki|homeproxy|dae) ;;
+                *) echo "未知变体：$variant（可选 nikki/homeproxy/dae）" >&2; exit 1 ;;
+              esac
+              matrix="${matrix}{\"target\":\"$target\",\"variant\":\"$variant\"},"
+              count=$((count + 1))
+            done
+          done
+          if [ "$count" -eq 0 ]; then
+            echo "没有可构建的变体，请检查 variants 输入" >&2
+            exit 1
+          fi
+          matrix="${matrix%,}]"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "本次矩阵：$matrix"
 
       - name: 检查该提交是否已构建
         id: built
@@ -142,27 +177,29 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: dl
-          key: ponwrt-dl-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          key: ponwrt-dl-${{ hashFiles('feeds.conf.default', 'configs/*.config', 'configs/variants/*.config') }}
           restore-keys: ponwrt-dl-
           lookup-only: true
 
   build:
-    name: 编译 ${{ matrix.target }}
+    name: 编译 ${{ matrix.target }}-${{ matrix.variant }}
     needs: prepare
     if: needs.prepare.outputs.build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     environment: release
+    # 单个变体失败不影响其他变体；是否算整体成功由最后的汇总任务判断
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - an7581
-          - an7583
+        # 机型 × 变体，由 prepare 生成；两台设备各出 nikki / homeproxy / dae 三份固件
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
       CACHE_BASE: ponwrt-${{ matrix.target }}
       BUILD_DATE: ${{ needs.prepare.outputs.date }}
       BUILD_HASH: ${{ needs.prepare.outputs.short }}
+      VARIANT: ${{ matrix.variant }}
 
     steps:
       - uses: actions/checkout@v6
@@ -193,7 +230,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: dl
-          key: ponwrt-dl-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          key: ponwrt-dl-${{ hashFiles('feeds.conf.default', 'configs/*.config', 'configs/variants/*.config') }}
           restore-keys: ponwrt-dl-
 
       - name: Restore toolchain cache
@@ -267,18 +304,50 @@ jobs:
             openssl ec -in private-key.pem -pubout -out public-key.pem
           fi
 
-      - name: Configure ${{ matrix.target }}
+      - name: Configure ${{ matrix.target }}-${{ matrix.variant }}
         run: |
           ./scripts/kconfig.pl + \
             "configs/${{ matrix.target }}.config" \
-            configs/release.config > .config
+            configs/release.config \
+            "configs/variants/${{ matrix.variant }}.config" > .config
           make defconfig
-          grep -E '^CONFIG_(CCACHE|PACKAGE_luci-app-npu|PACKAGE_luci-app-nikki)=' .config || true
+          grep -E '^CONFIG_(CCACHE|DEVEL|AUTOREBUILD|PACKAGE_luci-app-nikki|PACKAGE_luci-app-homeproxy|PACKAGE_luci-app-daed|PACKAGE_sing-box|PACKAGE_mihomo-meta|PACKAGE_luci-app-airoha-npu|KERNEL_DEBUG_INFO_BTF|KERNEL_BPF_EVENTS)=' .config || true
+
+      - name: 校验变体配置
+        run: |
+          case "$VARIANT" in
+            nikki)     want="luci-app-nikki";     avoid="luci-app-homeproxy luci-app-daed" ;;
+            homeproxy) want="luci-app-homeproxy"; avoid="luci-app-nikki luci-app-daed" ;;
+            dae)       want="luci-app-daed";      avoid="luci-app-nikki luci-app-homeproxy luci-app-dae" ;;
+          esac
+          if ! grep -q "^CONFIG_PACKAGE_${want}=y$" .config; then
+            echo "❌ 变体 $VARIANT 未启用 $want" >&2
+            exit 1
+          fi
+          for pkg in $avoid; do
+            if grep -q "^CONFIG_PACKAGE_${pkg}=y$" .config; then
+              echo "❌ 变体 $VARIANT 不应包含 $pkg" >&2
+              exit 1
+            fi
+          done
+          if ! grep -q "^CONFIG_PACKAGE_luci-app-airoha-npu=y$" .config; then
+            echo "❌ 缺少 NPU 状态页" >&2
+            exit 1
+          fi
+          if [ "$VARIANT" = "dae" ]; then
+            for opt in CONFIG_KERNEL_DEBUG_INFO_BTF CONFIG_KERNEL_BPF_EVENTS; do
+              if ! grep -q "^${opt}=y$" .config; then
+                echo "❌ dae 变体缺少 $opt" >&2
+                exit 1
+              fi
+            done
+          fi
+          echo "✅ 变体 $VARIANT 配置校验通过"
 
       - name: Download sources
         run: make download -j"$(nproc)"
 
-      - name: Build ${{ matrix.target }}
+      - name: Build ${{ matrix.target }}-${{ matrix.variant }}
         run: make -j"$(nproc)"
 
       - name: Compiler cache statistics
@@ -302,21 +371,25 @@ jobs:
             ext="${base##*.}"
             stem="${stem#ponwrt-airoha-${{ matrix.target }}-}"
             stem="${stem//_/-}"
-            cp -f "$f" "upload/ponwrt-${stem}-${BUILD_DATE}-${BUILD_HASH}.${ext}"
+            cp -f "$f" "upload/ponwrt-${{ matrix.target }}-${stem}-${VARIANT}-${BUILD_DATE}-${BUILD_HASH}.${ext}"
           done
+          # 附上本次 .config，方便回查变体到底装了什么
+          cp -f .config "upload/ponwrt-${{ matrix.target }}-${VARIANT}-config-${BUILD_DATE}-${BUILD_HASH}.txt"
           echo "=== 本次产物 ==="
           ls -lh upload
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ponwrt-${{ matrix.target }}-${{ needs.prepare.outputs.short }}
+          name: ponwrt-${{ matrix.target }}-${{ matrix.variant }}-${{ needs.prepare.outputs.short }}
           path: upload/*
           if-no-files-found: error
           retention-days: 7
 
       - name: Save toolchain cache
         if: steps.restore-toolchain.outputs.cache-hit != 'true'
+        # 同一机型的不同变体共用一份工具链缓存，谁先保存都可以，落败的任务忽略报错
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           key: ${{ env.CACHE_BASE }}-toolchain-${{ needs.prepare.outputs.sha }}
@@ -326,6 +399,7 @@ jobs:
 
       - name: Save compiler cache
         if: steps.restore-ccache.outputs.cache-hit != 'true'
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           key: ${{ env.CACHE_BASE }}-ccache-${{ needs.prepare.outputs.sha }}
@@ -358,6 +432,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      complete: ${{ steps.complete.outputs.complete }}
+      missing: ${{ steps.complete.outputs.missing }}
     steps:
       - name: Download firmware archives
         uses: actions/download-artifact@v4
@@ -365,6 +442,31 @@ jobs:
           pattern: ponwrt-*
           path: release
           merge-multiple: true
+
+      - name: 检查产物是否齐全
+        id: complete
+        env:
+          MATRIX: ${{ needs.prepare.outputs.matrix }}
+        run: |
+          missing=""
+          while read -r pair; do
+            [ -n "$pair" ] || continue
+            matches=(release/*"${pair}"-config-*.txt)
+            if [ ! -e "${matches[0]}" ]; then
+              missing="$missing $pair"
+            fi
+          done < <(printf '%s' "$MATRIX" | jq -r '.[] | "\(.target)-\(.variant)"')
+
+          if [ -n "$missing" ]; then
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+            echo "missing=$missing" >> "$GITHUB_OUTPUT"
+            echo "⚠️ 以下变体没有产物，构建失败：$missing"
+          else
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+            echo "missing=" >> "$GITHUB_OUTPUT"
+            echo "✅ 全部变体都有产物"
+          fi
+          ls -lh release || true
 
       - name: Create checksums
         working-directory: release
@@ -377,6 +479,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           PRERELEASE: ${{ inputs.prerelease }}
+          MISSING: ${{ steps.complete.outputs.missing }}
         run: |
           args=(
             "$RELEASE_TAG"
@@ -386,17 +489,51 @@ jobs:
             --title "PonWrt $RELEASE_TAG"
             --generate-notes
           )
+          if [ -n "$MISSING" ]; then
+            args+=(--notes "⚠️ 本次缺少这些变体（构建失败，详见 Actions 日志）：$MISSING")
+          fi
           if [ "$PRERELEASE" = "true" ]; then
             args+=(--prerelease)
           fi
           gh release create "${args[@]}"
+
+  status:
+    name: 汇总构建结果
+    needs:
+      - prepare
+      - build
+      - release
+    if: always() && needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 结果
+        env:
+          COMPLETE: ${{ needs.release.outputs.complete }}
+          MISSING: ${{ needs.release.outputs.missing }}
+        run: |
+          {
+            echo "### PonWrt ${{ needs.prepare.outputs.tag }}"
+            echo ""
+            if [ "$COMPLETE" = "true" ]; then
+              echo "- 全部变体构建成功"
+            else
+              echo "- 缺失变体：${MISSING:-未知（发布任务未执行）}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$COMPLETE" != "true" ]; then
+            echo "::error::变体构建失败：${MISSING:-未知（发布任务未执行）}"
+            exit 1
+          fi
 
   mark-built:
     name: 记录已构建提交
     needs:
       - prepare
       - build
-    if: needs.prepare.outputs.build == 'true' && needs.build.result == 'success'
+      - release
+    # 只有所有变体都出齐才记录，否则下次定时构建仍会重试
+    if: needs.prepare.outputs.build == 'true' && needs.release.outputs.complete == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: 保存构建标记
