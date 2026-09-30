@@ -1,0 +1,26 @@
+# 每周一 05:00（北京时间 = 周日 21:00 UTC）清理旧固件 Release
+name: Auto-Clean
+
+on:
+  schedule:
+    - cron: '0 21 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  auto_clean:
+    name: 清理旧 Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete Old Releases
+        uses: ophub/delete-releases-workflows@main
+        with:
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          delete_releases: true
+          # 保留最近 3 个版本；标签里带 mihomo 的那版（首个可用的 PonWrt+mihomo
+          # 固件，MD/MF 都刷过它）永久保留，作为可回退的基线
+          releases_keep_latest: 3
+          releases_keep_keyword: 'mihomo'
+          delete_tags: true
