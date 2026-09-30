@@ -73,8 +73,27 @@ jobs:
       - name: Add Airoha NPU status app
         run: |
           git clone --depth 1 https://github.com/rchen14b/luci-app-airoha-npu.git /tmp/airoha-npu
-          cp -r /tmp/airoha-npu/luci-app-airoha-npu feeds/luci/applications/
-          ./scripts/feeds install luci-app-airoha-npu
+          mkdir -p package/luci-app-airoha-npu
+          cp -r /tmp/airoha-npu/Makefile /tmp/airoha-npu/htdocs /tmp/airoha-npu/root \
+                /tmp/airoha-npu/po /tmp/airoha-npu/LICENSE package/luci-app-airoha-npu/
+          # Some DTS revisions (e.g. Nokia XG-040G-MF on PonWrt) omit the NPU
+          # firmware-name property, which makes the status page report an unknown
+          # firmware version. Fall back to scanning the firmware directory.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("package/luci-app-airoha-npu/root/usr/libexec/rpcd/luci.airoha_npu")
+          source = path.read_text()
+          anchor = 'local npu_ver="Unknown"'
+          fallback = (
+              'if [ -z "$npu_fw" ] || [ ! -f "$npu_fw" ]; then '
+              'npu_fw=$(ls -1 /lib/firmware/airoha/*rv32*.bin 2>/dev/null | head -1); fi\n'
+          )
+          if "rv32*.bin" not in source and anchor in source:
+              path.write_text(source.replace("\t" + anchor, "\t" + fallback + "\t" + anchor, 1))
+              print("patched NPU firmware-name fallback")
+          PY
+          bash -n package/luci-app-airoha-npu/root/usr/libexec/rpcd/luci.airoha_npu
 
       - name: Load repository signing key
         env:
