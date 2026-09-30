@@ -133,7 +133,7 @@ menuconfig DEVEL
 		  root filesystem directory.
 
 	config CCACHE
-		bool "Use ccache" if DEVEL
+		bool "Use ccache"
 		help
 		  Compiler cache; see https://ccache.samba.org/
 

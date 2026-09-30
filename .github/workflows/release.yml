@@ -13,7 +13,9 @@ on:
         default: true
         type: boolean
 
+# actions: write 用于构建结束后清理被新版取代的缓存
 permissions:
+  actions: write
   contents: read
 
 concurrency:
@@ -32,6 +34,8 @@ jobs:
         target:
           - an7581
           - an7583
+    env:
+      CACHE_BASE: ponwrt-${{ matrix.target }}
 
     steps:
       - uses: actions/checkout@v6
@@ -57,13 +61,45 @@ jobs:
             qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
             uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
 
-      - name: Cache downloads
+      # ---------- 三层缓存：源码包 / 工具链 / 编译器缓存 ----------
+      - name: Restore download cache
         uses: actions/cache@v4
         with:
           path: dl
-          key: ponwrt-dl-${{ matrix.target }}-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
-          restore-keys: |
-            ponwrt-dl-${{ matrix.target }}-
+          key: ${{ env.CACHE_BASE }}-dl-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          restore-keys: ${{ env.CACHE_BASE }}-dl-
+
+      - name: Restore toolchain cache
+        id: restore-toolchain
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            staging_dir/host*
+            staging_dir/tool*
+          key: ${{ env.CACHE_BASE }}-toolchain-${{ github.sha }}
+          restore-keys: ${{ env.CACHE_BASE }}-toolchain-
+
+      - name: Restore compiler cache
+        id: restore-ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ${{ env.CACHE_BASE }}-ccache-${{ github.sha }}
+          restore-keys: ${{ env.CACHE_BASE }}-ccache-
+
+      - name: Prepare restored caches
+        run: |
+          mkdir -p .ccache
+          if [ -d staging_dir ]; then
+            # 让 make 认为 host 工具与交叉工具链已经构建完成，跳过这 30-50 分钟
+            find staging_dir -type d -name stamp -not -path "*target*" |
+              while read -r dir; do find "$dir" -type f -exec touch {} +; done
+            echo "已复用工具链缓存（stamp 时间戳已刷新）"
+          else
+            echo "未命中工具链缓存，本次完整构建工具链"
+          fi
+          ccache --version | head -1
+          ccache -s | head -3 || true
 
       - name: Install feeds
         run: |
@@ -111,12 +147,17 @@ jobs:
             "configs/${{ matrix.target }}.config" \
             configs/release.config > .config
           make defconfig
+          grep -E '^CONFIG_(CCACHE|PACKAGE_luci-app-npu|PACKAGE_luci-app-nikki)=' .config || true
 
       - name: Download sources
         run: make download -j"$(nproc)"
 
       - name: Build ${{ matrix.target }}
         run: make -j"$(nproc)"
+
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache -s || true
 
       - name: Pack ${{ matrix.target }}
         run: |
@@ -131,6 +172,38 @@ jobs:
           path: release/*.tar.zst
           if-no-files-found: error
           retention-days: 7
+
+      - name: Save toolchain cache
+        if: steps.restore-toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ env.CACHE_BASE }}-toolchain-${{ github.sha }}
+          path: |
+            staging_dir/host*
+            staging_dir/tool*
+
+      - name: Save compiler cache
+        if: steps.restore-ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ env.CACHE_BASE }}-ccache-${{ github.sha }}
+          path: .ccache
+
+      - name: Cleanup superseded caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          delete_old_caches() {
+            local PREFIX="$1" CURRENT="$2"
+            while IFS=$'\t' read -r ID KEY; do
+              if [[ "$KEY" == "$PREFIX"* && "$KEY" != "$CURRENT" ]]; then
+                gh cache delete "$ID" 2>/dev/null || echo "skip $KEY"
+              fi
+            done < <(gh cache list --limit 100 --json id,key --jq '.[] | [.id, .key] | @tsv')
+          }
+          delete_old_caches "$CACHE_BASE-toolchain-" "$CACHE_BASE-toolchain-${{ github.sha }}"
+          delete_old_caches "$CACHE_BASE-ccache-" "$CACHE_BASE-ccache-${{ github.sha }}"
+          echo "superseded caches cleanup done"
 
   release:
     name: Create release
